@@ -4,25 +4,26 @@ Orchestrator for the **kanban** app. Holds the canonical product docs, the subag
 
 ```
 kanban-control-panel/
-├── README.md          # this file
-├── CLAUDE.md          # full AI guidance for the whole project
+├── README.md            # this file
+├── CLAUDE.md            # full AI guidance for the whole project
 ├── doc/
-│   ├── spec.md        # canonical Phase 1 product spec
-│   ├── plan.md        # task-level build plan (M0 – M7)
-│   └── retrospective.md  # sprint-by-sprint retro (mirrored to ClickUp)
+│   ├── spec.md          # canonical Phase 1 product spec
+│   ├── plan.md          # task-level build plan (M0 – M7)
+│   └── retrospective.md # sprint-by-sprint retro (mirrored to ClickUp)
 ├── .claude/agents/
-│   ├── backend.md     # backend specialist subagent
-│   ├── frontend.md    # frontend specialist subagent
-│   └── qa.md          # QA specialist subagent
+│   ├── backend.md       # backend specialist subagent
+│   ├── frontend.md      # frontend specialist subagent
+│   └── qa.md            # QA specialist subagent
 ├── scripts/
-│   ├── dev.sh         # spawns backend + frontend dev servers together
-│   ├── smoke.sh       # E2E API happy-path test (12 steps)
-│   ├── isolation.sh   # cross-user authorization regression (19 checks)
+│   ├── dev.sh           # native dev — go run + npm run dev
+│   ├── smoke.sh         # E2E API happy-path test (12 steps)
+│   ├── isolation.sh     # cross-user authorization regression (19 checks)
 │   └── README.md
-├── .env.example       # shared env template
+├── docker-compose.yml   # production-style stack — nginx + backend
+├── .env.example         # shared env template (JWT_SECRET, HOST_PORT, …)
 ├── .gitignore
-├── backend            # → git submodule: kanban-backend
-└── frontend           # → git submodule: kanban-frontend
+├── backend              # → git submodule: kanban-backend (has Dockerfile)
+└── frontend             # → git submodule: kanban-frontend (has Dockerfile + nginx.conf)
 ```
 
 ## Architecture at a glance
@@ -52,22 +53,49 @@ cd kanban-control-panel
 
 # If you forgot --recursive:
 git submodule update --init --recursive
+```
 
-# Backend env (only JWT_SECRET is required).
+Pick one of the two run modes below.
+
+### Option A — Production-style (docker compose)
+
+Single port for users; nginx serves the SPA and proxies `/api/*` to the backend over the internal docker network. Persistent SQLite volume.
+
+```bash
+cp .env.example .env
+# edit .env, set JWT_SECRET=<a long random string>
+
+docker compose up --build
+```
+
+Then open **http://localhost:8080**. The backend container is NOT exposed to the host by default (only nginx is); uncomment the `ports:` block under `backend:` in `docker-compose.yml` if you want direct `curl http://localhost:8080/api/...` access.
+
+Tear down:
+```bash
+docker compose down              # keeps the SQLite volume
+docker compose down -v           # wipes the SQLite volume too
+```
+
+### Option B — Native dev (hot reload)
+
+Best for active development. Runs `go run` and `npm run dev` together with prefixed logs.
+
+```bash
 cp backend/.env.example backend/.env
 # edit backend/.env, set JWT_SECRET=<a long random string>
 
-# Run the whole stack:
 ./scripts/dev.sh
 ```
 
 Then:
-- Frontend (Vite dev): http://localhost:5173
-- Backend (Gin): http://localhost:8080
+- Frontend (Vite dev w/ HMR): http://localhost:5173
+- Backend (Gin):              http://localhost:8080
 
 The Vite dev server proxies `/api/*` to `:8080`.
 
-The **first user to register** automatically becomes admin. To bootstrap admin access on an existing DB, set `PROMOTE_EMAIL=you@example.com` before starting the backend (or run `./scripts/dev.sh` after `export PROMOTE_EMAIL=...`).
+---
+
+The **first user to register** automatically becomes admin (atomic in a SQL transaction). To bootstrap admin access on an existing DB, set `PROMOTE_EMAIL=you@example.com` in `.env` (compose) or `backend/.env` (native) before starting the backend.
 
 ## Testing the live API
 
@@ -105,6 +133,7 @@ git push
 
 ## Future work
 
-- Per-service Dockerfiles + a top-level `docker-compose.yml` for one-command containerised dev.
 - CI for each service repo (currently no GitHub Actions workflows).
 - Frontend test suite (Vitest unit + component, plus an E2E pass).
+- Push container images to a registry (currently they're built locally as `kanban-backend:local` / `kanban-frontend:local`).
+- HTTPS termination (the nginx config terminates plain HTTP today).

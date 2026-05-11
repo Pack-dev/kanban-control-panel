@@ -1,0 +1,65 @@
+# docker-compose.yml — production-style local stack.
+#
+# Single entry point: the frontend container's nginx serves the SPA on
+# ${HOST_PORT:-8080} and proxies /api/* to the backend service over the
+# internal docker network. The backend is NOT exposed to the host.
+#
+# Usage:
+#   git clone --recursive https://github.com/Pack-dev/kanban-control-panel.git
+#   cd kanban-control-panel
+#   cp .env.example .env       # set JWT_SECRET (required) and any overrides
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# If you're already running ./scripts/dev.sh, stop it first — both bind :8080
+# by default. Or set HOST_PORT=8081 in your .env.
+
+services:
+  backend:
+    build:
+      context: ./backend
+    image: kanban-backend:local
+    container_name: kanban-backend
+    restart: unless-stopped
+    environment:
+      PORT: "8080"
+      DB_PATH: /data/app.db
+      # Browser hits the nginx front-door, not the backend directly, so the
+      # CORS_ORIGIN here only matters if someone curls /api from another origin.
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — copy .env.example to .env}
+      PROMOTE_EMAIL: ${PROMOTE_EMAIL:-}
+    volumes:
+      - kanban_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - kanban
+    # Backend port is intentionally NOT published — only nginx talks to it.
+    # Uncomment for direct curl access during debugging:
+    # ports:
+    #   - "8080:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+    image: kanban-frontend:local
+    container_name: kanban-frontend
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - kanban
+
+volumes:
+  kanban_data:
+
+networks:
+  kanban:
