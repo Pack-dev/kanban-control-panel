@@ -9,11 +9,20 @@ A kanban app with global RBAC. Each user has many boards; each board has user-de
 
 ## 2. Stack
 
-Unchanged from the todo app, plus two new libraries:
-
-- **Backend** — Go, Gin, `modernc.org/sqlite`, `golang-jwt/jwt/v5`, `bcrypt`, `godotenv`.
+- **Backend** — Go, Gin, **Postgres via `github.com/jackc/pgx/v5/stdlib`** (database/sql compat), `golang-jwt/jwt/v5`, `bcrypt`, `godotenv`. (Originally shipped on `modernc.org/sqlite`; migrated to Postgres for deployment parity. See [Postgres switch](#postgres-switch-2026-05-11) note below.)
 - **Frontend** — Vue 3 (`<script setup>`), Vite, Pinia, Vue Router 4, Axios.
-- **New**: `vuedraggable@next` (drag-and-drop), `marked` + `DOMPurify` (markdown render + sanitize).
+- **Drag + markdown**: `vuedraggable@next`, `marked` + `DOMPurify` (sanitised render).
+
+### Postgres switch (2026-05-11)
+
+The data layer was migrated from SQLite to Postgres without changing the API contract:
+
+- **Storage shape**: `BIGSERIAL` ids, `DOUBLE PRECISION` for `position`, `TIMESTAMPTZ DEFAULT NOW()` for the auto-populated `users.created_at`. All other `created_at` / `updated_at` columns stay `TEXT` carrying application-supplied RFC 3339 strings (matches the spec's "Timestamps: ISO 8601 strings" rule).
+- **Wire format unchanged**: booleans still go over the wire as integer `0`/`1` (the `done INTEGER` column type is preserved). All response shapes are identical.
+- **Connection**: `DATABASE_URL` env var replaces the SQLite `DB_PATH`. No file mount; the backend container is stateless.
+- **FKs / cascade**: Postgres enforces foreign keys natively, so the SQLite-only `_pragma=foreign_keys(1)` is no longer needed.
+- **Idempotency**: `INSERT ... ON CONFLICT DO NOTHING` replaces `INSERT OR IGNORE`. Unique-violation detection uses SQLSTATE `23505` (`pgconn.PgError`) instead of message-substring matching.
+- **Migrations**: `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ADD COLUMN IF NOT EXISTS` (Postgres 9.6+), still no migration framework.
 
 ## 3. Pivot from todo app
 
@@ -27,59 +36,63 @@ Unchanged from the todo app, plus two new libraries:
 ### Tables
 
 ```sql
--- existing table; one additive column for RBAC
-users(id, email UNIQUE, password_hash, role TEXT NOT NULL DEFAULT 'user', created_at)
--- role enum: 'admin' | 'user'. See §5b for semantics.
+users(
+  id             BIGSERIAL PRIMARY KEY,
+  email          TEXT UNIQUE NOT NULL,
+  password_hash  TEXT NOT NULL,
+  role           TEXT NOT NULL DEFAULT 'user',          -- 'admin' | 'user'; see §5b
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
 
 boards(
-  id          INTEGER PRIMARY KEY,
-  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name        TEXT NOT NULL,
-  position    REAL NOT NULL,         -- sidebar order
-  created_at  TEXT NOT NULL,
+  position    DOUBLE PRECISION NOT NULL,    -- sidebar order
+  created_at  TEXT NOT NULL,                -- RFC 3339, app-managed
   updated_at  TEXT NOT NULL
 )
 
-columns(
-  id          INTEGER PRIMARY KEY,
-  board_id    INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+"columns"(                                  -- quoted: COLUMN is reserved
+  id          BIGSERIAL PRIMARY KEY,
+  board_id    BIGINT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   name        TEXT NOT NULL,
-  position    REAL NOT NULL,         -- left-to-right order in board
+  position    DOUBLE PRECISION NOT NULL,    -- left-to-right within board
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 )
 
 cards(
-  id          INTEGER PRIMARY KEY,
-  column_id   INTEGER NOT NULL REFERENCES columns(id) ON DELETE CASCADE,
+  id          BIGSERIAL PRIMARY KEY,
+  column_id   BIGINT NOT NULL REFERENCES "columns"(id) ON DELETE CASCADE,
   title       TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',   -- markdown
-  due_date    TEXT NULL,                  -- ISO 8601 date (YYYY-MM-DD)
-  position    REAL NOT NULL,              -- top-to-bottom within column
+  description TEXT NOT NULL DEFAULT '',     -- markdown
+  due_date    TEXT NULL,                    -- ISO 8601 date (YYYY-MM-DD)
+  position    DOUBLE PRECISION NOT NULL,    -- top-to-bottom within column
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 )
 
 labels(
-  id          INTEGER PRIMARY KEY,
-  board_id    INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  id          BIGSERIAL PRIMARY KEY,
+  board_id    BIGINT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   name        TEXT NOT NULL,
-  color       TEXT NOT NULL,              -- enum: label-1 .. label-8 (maps to CSS tokens)
+  color       TEXT NOT NULL,                -- enum: label-1 .. label-8
   created_at  TEXT NOT NULL
 )
 
 card_labels(
-  card_id   INTEGER NOT NULL REFERENCES cards(id)  ON DELETE CASCADE,
-  label_id  INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+  card_id   BIGINT NOT NULL REFERENCES cards(id)  ON DELETE CASCADE,
+  label_id  BIGINT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
   PRIMARY KEY (card_id, label_id)
 )
 
 checklist_items(
-  id          INTEGER PRIMARY KEY,
-  card_id     INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+  id          BIGSERIAL PRIMARY KEY,
+  card_id     BIGINT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
   text        TEXT NOT NULL,
-  done        INTEGER NOT NULL DEFAULT 0, -- 0/1, matches project convention
-  position    REAL NOT NULL,
+  done        INTEGER NOT NULL DEFAULT 0,   -- 0/1; matches wire format
+  position    DOUBLE PRECISION NOT NULL,
   created_at  TEXT NOT NULL
 )
 ```
@@ -88,7 +101,7 @@ checklist_items(
 
 ```sql
 CREATE INDEX idx_boards_user_id      ON boards(user_id);
-CREATE INDEX idx_columns_board_id    ON columns(board_id);
+CREATE INDEX idx_columns_board_id    ON "columns"(board_id);
 CREATE INDEX idx_cards_column_id     ON cards(column_id);
 CREATE INDEX idx_labels_board_id     ON labels(board_id);
 CREATE INDEX idx_checklist_card_id   ON checklist_items(card_id);
@@ -96,9 +109,9 @@ CREATE INDEX idx_checklist_card_id   ON checklist_items(card_id);
 
 ### Notes
 
-- `position` is `REAL` so fractional reinsertion (`(prev + next) / 2`) avoids re-numbering siblings on every drag. A periodic compaction routine can rebalance if values get too close (out of scope for Phase 1).
-- All deletes cascade through the chain `users → boards → columns → cards → {card_labels, checklist_items}`. SQLite's `foreign_keys=1` pragma is already enabled in the DSN — keep it.
-- Migrations stay as idempotent `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` in `internal/db`. No migration framework.
+- `position` is `DOUBLE PRECISION` so fractional reinsertion (`(prev + next) / 2`) avoids re-numbering siblings on every drag. A periodic compaction routine can rebalance if values get too close (out of scope for Phase 1).
+- All deletes cascade through the chain `users → boards → columns → cards → {card_labels, checklist_items}`. Postgres enforces FKs natively.
+- Migrations stay as idempotent `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` + `ALTER TABLE ADD COLUMN IF NOT EXISTS` (Postgres 9.6+) in `internal/db`. No migration framework.
 
 ## 5. Auth
 

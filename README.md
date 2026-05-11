@@ -1,6 +1,6 @@
 # kanban-control-panel
 
-Orchestrator for the **kanban** app. Holds the canonical product docs, the subagent definitions, the QA scripts, and a dev launcher that runs the whole stack with one command. The two service repos are wired in as git submodules.
+Orchestrator for the **kanban** app. Holds the canonical product docs, the subagent definitions, the QA scripts, a Postgres-backed dev stack via `docker compose`, and a native dev launcher. The two service repos are wired in as git submodules.
 
 ```
 kanban-control-panel/
@@ -19,7 +19,7 @@ kanban-control-panel/
 │   ├── smoke.sh         # E2E API happy-path test (12 steps)
 │   ├── isolation.sh     # cross-user authorization regression (19 checks)
 │   └── README.md
-├── docker-compose.yml   # production-style stack — nginx + backend
+├── docker-compose.yml   # production-style stack — nginx + backend + postgres
 ├── .env.example         # shared env template (JWT_SECRET, HOST_PORT, …)
 ├── .gitignore
 ├── backend              # → git submodule: kanban-backend (has Dockerfile)
@@ -34,15 +34,21 @@ kanban-control-panel/
             │  - docs (spec / plan / retro)      │
             │  - agent defs                      │
             │  - QA scripts                      │
-            │  - dev orchestration               │
+            │  - docker-compose + dev script     │
             └──┬──────────────────────────────┬──┘
                │ submodule                    │ submodule
        ┌───────▼─────────┐            ┌───────▼─────────┐
        │ kanban-backend  │            │ kanban-frontend │
        │ Go + Gin + JWT  │  HTTP/JSON │ Vue 3 + Vite    │
-       │ SQLite, RBAC    │ ◄──────────┤ Pinia, axios    │
+       │ Postgres / RBAC │ ◄──────────┤ Pinia, axios    │
        │ :8080           │            │ :5173 (dev)     │
-       └─────────────────┘            └─────────────────┘
+       └───────┬─────────┘            └─────────────────┘
+               │ pgx
+       ┌───────▼─────────┐
+       │ postgres:16     │
+       │ kanban db       │
+       │ :5432           │
+       └─────────────────┘
 ```
 
 ## Getting started
@@ -59,30 +65,31 @@ Pick one of the two run modes below.
 
 ### Option A — Production-style (docker compose)
 
-Single port for users; nginx serves the SPA and proxies `/api/*` to the backend over the internal docker network. Persistent SQLite volume.
+Single port for users; nginx serves the SPA and proxies `/api/*` to the backend over the internal docker network. Postgres runs as a service with a persistent volume.
 
 ```bash
 cp .env.example .env
-# edit .env, set JWT_SECRET=<a long random string>
+# edit .env: set JWT_SECRET. Defaults work for POSTGRES_* in dev.
 
 docker compose up --build
 ```
 
-Then open **http://localhost:8080**. The backend container is NOT exposed to the host by default (only nginx is); uncomment the `ports:` block under `backend:` in `docker-compose.yml` if you want direct `curl http://localhost:8080/api/...` access.
+Then open **http://localhost:8080**. Postgres is published on the host at `${POSTGRES_HOST_PORT:-5432}` for direct `psql` / test access. The backend container is NOT exposed to the host by default (only nginx is); uncomment the `ports:` block under `backend:` in `docker-compose.yml` for direct API debugging.
 
 Tear down:
 ```bash
-docker compose down              # keeps the SQLite volume
-docker compose down -v           # wipes the SQLite volume too
+docker compose down              # keeps the Postgres volume
+docker compose down -v           # wipes the Postgres volume too
 ```
 
 ### Option B — Native dev (hot reload)
 
-Best for active development. Runs `go run` and `npm run dev` together with prefixed logs.
+Best for active development. Runs `go run` and `npm run dev` together with prefixed logs. Requires Postgres reachable at `DATABASE_URL` (easiest: `docker compose up -d postgres` then run the rest natively).
 
 ```bash
+docker compose up -d postgres                    # or use any reachable Postgres
 cp backend/.env.example backend/.env
-# edit backend/.env, set JWT_SECRET=<a long random string>
+# edit backend/.env: set JWT_SECRET; check DATABASE_URL points at your postgres
 
 ./scripts/dev.sh
 ```
@@ -92,6 +99,18 @@ Then:
 - Backend (Gin):              http://localhost:8080
 
 The Vite dev server proxies `/api/*` to `:8080`.
+
+### Running backend integration tests
+
+Tests use a **separate** Postgres DB (each test creates and drops its own schema, so it just needs CREATE/DROP-SCHEMA privilege). Easiest path with the compose stack already up:
+
+```bash
+docker compose exec postgres createdb -U "$POSTGRES_USER" kanban_test
+TEST_DATABASE_URL="postgres://kanban:kanban@localhost:${POSTGRES_HOST_PORT:-5432}/kanban_test?sslmode=disable" \
+  go -C backend test ./... -count=1 -cover
+```
+
+If `TEST_DATABASE_URL` is unset, integration tests **skip** rather than fail — so `go test ./...` still works for syntax-only checks.
 
 ---
 

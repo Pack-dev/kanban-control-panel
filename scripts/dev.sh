@@ -20,7 +20,15 @@ if [[ ! -d "$ROOT/backend" || ! -d "$ROOT/frontend" ]]; then
 fi
 
 if [[ ! -f "$ROOT/backend/.env" ]]; then
-  echo "warn: backend/.env not found; the server will fail if JWT_SECRET is unset" >&2
+  echo "warn: backend/.env not found; the server will fail if JWT_SECRET / DATABASE_URL are unset" >&2
+  echo "      cp backend/.env.example backend/.env  and fill in JWT_SECRET" >&2
+fi
+
+# Postgres reachability check. The backend requires a live Postgres at DATABASE_URL.
+# We don't parse the URL here — just nudge the user toward a fix if 5432 looks dead.
+if ! (nc -z localhost 5432 2>/dev/null || nc -z 127.0.0.1 5432 2>/dev/null); then
+  echo "warn: nothing listening on localhost:5432 — Postgres may not be running." >&2
+  echo "      easiest fix: docker compose up -d postgres" >&2
 fi
 
 # Track child PIDs so we can clean up on exit.

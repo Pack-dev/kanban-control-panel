@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repo.
 
 A full-stack **kanban board** app with role-based access control.
 
-- **Backend**: Go (Gin) REST API, SQLite storage, JWT auth, RBAC (admin / user).
+- **Backend**: Go (Gin) REST API, **Postgres** via `pgx/v5` (database/sql compat), JWT auth, RBAC (admin / user).
 - **Frontend**: Vue 3 (Vite, Pinia, Vue Router), custom pastel + dark-mode styling, drag-and-drop.
 
 The repo started as a todo-list and was **pivoted to kanban on 2026-05-11**. Phase 1 (M0–M7) is complete.
@@ -27,7 +27,7 @@ Backend serves JSON on `/api/*`. Frontend is a separate Vite dev server during d
 ## Backend
 
 - Framework: `github.com/gin-gonic/gin`
-- DB driver: `modernc.org/sqlite` (pure Go, no CGO)
+- DB driver: `github.com/jackc/pgx/v5/stdlib` (Postgres, database/sql compat)
 - JWT: `github.com/golang-jwt/jwt/v5`
 - Password hashing: `golang.org/x/crypto/bcrypt`
 - Env loading: `github.com/joho/godotenv`
@@ -35,7 +35,8 @@ Backend serves JSON on `/api/*`. Frontend is a separate Vite dev server during d
 ### Env vars (see `backend/.env.example`)
 - `PORT` — HTTP port (default 8080)
 - `JWT_SECRET` — required, used to sign tokens
-- `DB_PATH` — SQLite file path (default `./data/app.db`)
+- `DATABASE_URL` — **required**, Postgres URL (`postgres://user:pw@host:5432/dbname?sslmode=disable`)
+- `TEST_DATABASE_URL` — Postgres URL used by `go test`. Unset → integration tests skip. Each test creates and drops its own schema, so this user needs `CREATE` / `DROP SCHEMA` privilege.
 - `CORS_ORIGIN` — frontend origin for CORS (default `http://localhost:5173`)
 - `PROMOTE_EMAIL` — **optional, dev convenience.** On startup, promotes the matching user (by email) to admin. Useful when an existing DB pre-dates RBAC. No-op if the email doesn't exist.
 
@@ -94,7 +95,9 @@ card_labels(card_id FK→cards, label_id FK→labels, PRIMARY KEY (card_id, labe
 checklist_items(id, card_id FK→cards, text, done INT 0/1, position, created_at)
 ```
 
-All FKs cascade. DSN sets `_pragma=foreign_keys(1)` (load-bearing) and `journal_mode=WAL`. Migrations run on startup: `CREATE TABLE IF NOT EXISTS` plus a defensive `ALTER TABLE ADD COLUMN` pass with "duplicate column" tolerated (used to add `users.role` to pre-RBAC DBs).
+Concrete column types: `id`/`*_id` are `BIGSERIAL`/`BIGINT`, `position` is `DOUBLE PRECISION`, `users.created_at` is `TIMESTAMPTZ DEFAULT NOW()` (auto-populated), all other `created_at`/`updated_at` columns are `TEXT` carrying RFC 3339 strings via `nowISO()`. `"columns"` is double-quoted (COLUMN is reserved).
+
+All FKs cascade. Postgres enforces foreign keys natively. Migrations run on startup: `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS` + `ALTER TABLE ADD COLUMN IF NOT EXISTS` (Postgres 9.6+).
 
 ### RBAC
 
@@ -141,7 +144,8 @@ Custom CSS with CSS-custom-property palette (paper / ink / accent / good / warn 
   - Timestamps = ISO 8601 strings, server-generated.
   - Empty-body `PUT` → 400.
 - **Status codes**: cross-user / cross-board violations → **404** (no existence leak). RBAC role denial → **403**.
-- Don't commit `backend/data/app.db` or any `.env` file.
+- Don't commit any `.env` file (DBs are managed externally now — no local file to leak).
+- SQL: positional placeholders `$1, $2, …` (Postgres). Inserts use `RETURNING id` + `QueryRow().Scan(&id)`, NOT `LastInsertId`. Idempotent inserts use `INSERT ... ON CONFLICT DO NOTHING`. Unique-violation detection is SQLSTATE `23505` via `pgconn.PgError` (see `handlers/auth.go` `isUniqueViolation`).
 
 ## Status
 

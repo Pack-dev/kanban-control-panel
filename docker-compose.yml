@@ -1,8 +1,13 @@
 # docker-compose.yml — production-style local stack.
 #
+# Topology:
+#   postgres  — persistent volume, port 5432 (configurable)
+#   backend   — Go + pgx, depends on postgres healthcheck
+#   frontend  — nginx serving the SPA + proxying /api → backend
+#
 # Single entry point: the frontend container's nginx serves the SPA on
-# ${HOST_PORT:-8080} and proxies /api/* to the backend service over the
-# internal docker network. The backend is NOT exposed to the host.
+# ${HOST_PORT:-8080} and proxies /api/* to the backend over the internal
+# docker network. The backend itself is NOT exposed to the host.
 #
 # Usage:
 #   git clone --recursive https://github.com/Pack-dev/kanban-control-panel.git
@@ -10,11 +15,32 @@
 #   cp .env.example .env       # set JWT_SECRET (required) and any overrides
 #   docker compose up --build
 #   open http://localhost:8080
-#
-# If you're already running ./scripts/dev.sh, stop it first — both bind :8080
-# by default. Or set HOST_PORT=8081 in your .env.
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kanban-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kanban}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kanban}
+      POSTGRES_DB: ${POSTGRES_DB:-kanban}
+    volumes:
+      - kanban_pgdata:/var/lib/postgresql/data
+    # Published so you can `psql` against it from the host or run integration
+    # tests with TEST_DATABASE_URL pointing here. Override the host port if
+    # something else (a system postgres) already binds 5432.
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kanban} -d ${POSTGRES_DB:-kanban}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - kanban
+
   backend:
     build:
       context: ./backend
@@ -23,14 +49,15 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
-      DB_PATH: /data/app.db
+      DATABASE_URL: postgres://${POSTGRES_USER:-kanban}:${POSTGRES_PASSWORD:-kanban}@postgres:5432/${POSTGRES_DB:-kanban}?sslmode=disable
       # Browser hits the nginx front-door, not the backend directly, so the
       # CORS_ORIGIN here only matters if someone curls /api from another origin.
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required — copy .env.example to .env}
       PROMOTE_EMAIL: ${PROMOTE_EMAIL:-}
-    volumes:
-      - kanban_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: 10s
@@ -59,7 +86,7 @@ services:
       - kanban
 
 volumes:
-  kanban_data:
+  kanban_pgdata:
 
 networks:
   kanban:
